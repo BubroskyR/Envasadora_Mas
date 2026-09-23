@@ -75,7 +75,8 @@ app.post('/api/entregas', async (req, res) => {
   const client = await pool.connect(); 
 
   try {
-    const { cliente_id, cantidad_bidones, monto_pagado, monto_adeudado } = req.body;
+    const { cliente_id, cantidad_bidones, monto_pagado, monto_total } = req.body;
+    const monto_adeudado = monto_total - monto_pagado;
 
     if (!cliente_id || !cantidad_bidones) {
       return res.status(400).json({ error: 'Faltan datos obligatorios (cliente_id, cantidad_bidones)' });
