@@ -216,6 +216,38 @@ app.post('/api/pagos', async (req, res) => {
     client.release();
   }
 });
+// Ruta GET: Obtener un cliente específico por su ID
+app.get('/api/clientes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM clientes WHERE id = $1', [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el cliente');
+  }
+});
+
+// Ruta GET: Obtener el historial de entregas de un cliente específico
+app.get('/api/clientes/:id/entregas', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Buscamos las entregas y las ordenamos desde la más reciente a la más antigua
+    const result = await pool.query(
+      'SELECT * FROM entregas WHERE cliente_id = $1 ORDER BY fecha DESC, id DESC', 
+      [id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de entregas');
+  }
+});
 
 // Iniciar el servidor
 const PORT = process.env.PORT || 3000;
