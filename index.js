@@ -281,6 +281,38 @@ app.put('/api/clientes/:id', async (req, res) => {
   }
 });
 
+// Ruta GET: Obtener todas las entregas generales (para calcular ingresos del gráfico)
+app.get('/api/entregas', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT e.*, c.nombre as cliente_nombre 
+      FROM entregas e 
+      LEFT JOIN clientes c ON e.cliente_id = c.id 
+      ORDER BY e.fecha DESC, e.id DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener entregas');
+  }
+});
+
+// Ruta GET: Obtener todos los pagos (para sumarlos a los ingresos)
+app.get('/api/pagos', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.*, c.nombre as cliente_nombre 
+      FROM pagos p 
+      LEFT JOIN clientes c ON p.cliente_id = c.id 
+      ORDER BY p.id DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener pagos');
+  }
+});
+
 // Iniciar el servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
