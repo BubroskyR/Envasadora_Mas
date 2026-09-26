@@ -294,6 +294,46 @@ app.put('/api/clientes/:id', async (req, res) => {
   }
 });
 
+// Ruta DELETE: Eliminar un cliente y todos sus registros asociados (Entregas y Pagos)
+app.delete('/api/clientes/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+
+    // 1. Iniciamos una transacción para asegurar la integridad de los datos
+    await client.query('BEGIN');
+
+    // 2. Eliminamos las entregas asociadas a este cliente
+    await client.query('DELETE FROM entregas WHERE cliente_id = $1', [id]);
+
+    // 3. Eliminamos los pagos asociados a este cliente
+    await client.query('DELETE FROM pagos WHERE cliente_id = $1', [id]);
+
+    // 4. Finalmente, eliminamos al cliente de la tabla clientes
+    const result = await client.query('DELETE FROM clientes WHERE id = $1 RETURNING *;', [id]);
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
+    // 5. Confirmamos la transacción
+    await client.query('COMMIT');
+
+    res.json({ mensaje: 'Cliente y sus registros asociados eliminados correctamente', cliente: result.rows[0] });
+
+  } catch (err) {
+    // Si ocurre algún error, deshacemos todos los cambios
+    await client.query('ROLLBACK');
+    console.error('Error al eliminar el cliente:', err.message);
+    res.status(500).send('Error en el servidor al eliminar el cliente');
+  } finally {
+    // Liberamos el cliente de la conexión
+    client.release();
+  }
+});
+
 // Ruta GET: Obtener todas las entregas generales (para calcular ingresos del gráfico)
 app.get('/api/entregas', async (req, res) => {
   try {
