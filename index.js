@@ -249,16 +249,26 @@ app.get('/api/clientes/:id/entregas', async (req, res) => {
   }
 });
 
-// Ruta PUT: Actualizar los datos de un cliente existente
+// Ruta PUT: Actualizar los datos de un cliente existente (VERSIÓN MEJORADA)
 app.put('/api/clientes/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre, direccion, telefono, consumo_semanal_estimado } = req.body;
+    // Extraemos todos los datos posibles, incluyendo los nuevos espaciales
+    const { nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud } = req.body;
 
+    // Usamos COALESCE para que si algún dato no se envía (es undefined o null), 
+    // la base de datos mantenga su valor actual y no lo borre accidentalmente.
     const updateQuery = `
       UPDATE clientes 
-      SET nombre = $1, direccion = $2, telefono = $3, consumo_semanal_estimado = $4
-      WHERE id = $5
+      SET 
+        nombre = COALESCE($1, nombre), 
+        direccion = COALESCE($2, direccion), 
+        telefono = COALESCE($3, telefono), 
+        consumo_semanal_estimado = COALESCE($4, consumo_semanal_estimado),
+        barrio = COALESCE($5, barrio),
+        latitud = COALESCE($6, latitud),
+        longitud = COALESCE($7, longitud)
+      WHERE id = $8
       RETURNING *;
     `;
     
@@ -267,6 +277,9 @@ app.put('/api/clientes/:id', async (req, res) => {
       direccion, 
       telefono, 
       consumo_semanal_estimado, 
+      barrio, 
+      latitud, 
+      longitud, 
       id
     ]);
 
