@@ -68,6 +68,25 @@ const prepararBaseDeDatos = async () => {
     CREATE INDEX IF NOT EXISTS idx_pagos_cliente ON pagos (cliente_id);
     CREATE INDEX IF NOT EXISTS idx_pagos_fecha ON pagos (fecha DESC);
     CREATE INDEX IF NOT EXISTS idx_gastos_fecha ON gastos (fecha DESC);
+
+    -- creado_en era "timestamp sin zona": guardaba la hora en la zona de cada conexión, así que los
+    -- registros viejos (en UTC) y los nuevos (hora argentina) no se podían comparar y el historial
+    -- de finanzas quedaba desordenado. Con timestamptz se guarda el instante exacto.
+    -- Los valores existentes se toman como UTC, que es como los guardaba el servidor antes del ajuste de zona.
+    DO $$
+    DECLARE tabla TEXT;
+    BEGIN
+      FOREACH tabla IN ARRAY ARRAY['entregas', 'pagos', 'gastos'] LOOP
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = tabla AND column_name = 'creado_en' AND data_type = 'timestamp without time zone'
+        ) THEN
+          EXECUTE format(
+            'ALTER TABLE %I ALTER COLUMN creado_en TYPE TIMESTAMPTZ USING creado_en AT TIME ZONE ''UTC'',
+                            ALTER COLUMN creado_en SET DEFAULT now()', tabla);
+        END IF;
+      END LOOP;
+    END $$;
   `);
 };
 
