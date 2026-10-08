@@ -61,6 +61,9 @@ const prepararBaseDeDatos = async () => {
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS barrio VARCHAR(100);
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS latitud NUMERIC;
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS longitud NUMERIC;
+    -- Borrado lógico: al eliminar un cliente se marca la fecha en vez de borrar la fila,
+    -- así sus entregas y pagos siguen contando en el historial de finanzas
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS eliminado_en TIMESTAMPTZ;
 
     -- Índices para que las búsquedas por cliente y por fecha no recorran la tabla entera
     CREATE INDEX IF NOT EXISTS idx_entregas_cliente_fecha ON entregas (cliente_id, fecha DESC);
@@ -208,7 +211,7 @@ app.use('/api', (req, res, next) => {
 // Ruta GET: Obtener todos los clientes
 app.get('/api/clientes', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM clientes ORDER BY deuda_actual DESC');
+    const result = await pool.query('SELECT * FROM clientes WHERE eliminado_en IS NULL ORDER BY deuda_actual DESC');
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -266,7 +269,7 @@ app.get('/api/clientes/:id', async (req, res) => {
   }
 
   try {
-    const result = await pool.query('SELECT * FROM clientes WHERE id = $1', [id]);
+    const result = await pool.query('SELECT * FROM clientes WHERE id = $1 AND eliminado_en IS NULL', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
@@ -296,6 +299,29 @@ app.get('/api/clientes/:id/entregas', async (req, res) => {
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Error al obtener el historial de entregas');
+  }
+});
+
+// Ruta GET: Obtener los pagos de deuda de un cliente (para mostrarlos en su historial junto a las entregas)
+app.get('/api/clientes/:id/pagos', async (req, res) => {
+  const { id } = req.params;
+  if (!esIdValido(id)) {
+    return res.json([]);
+  }
+
+  try {
+    // Si algún pago viejo quedó sin fecha, se usa el día en que se registró
+    const result = await pool.query(
+      `SELECT id, cliente_id, COALESCE(fecha, creado_en::date) AS fecha, monto, metodo_pago, creado_en
+       FROM pagos
+       WHERE cliente_id = $1
+       ORDER BY COALESCE(fecha, creado_en::date) DESC, creado_en DESC, id DESC`,
+      [id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de pagos');
   }
 });
 
@@ -354,7 +380,7 @@ app.put('/api/clientes/:id', async (req, res) => {
     // Los nombres de columna salen de la lista fija de arriba (nunca del usuario), y los valores van parametrizados
     values.push(id);
     const result = await pool.query(
-      `UPDATE clientes SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *;`,
+      `UPDATE clientes SET ${sets.join(', ')} WHERE id = $${values.length} AND eliminado_en IS NULL RETURNING *;`,
       values
     );
 
@@ -369,46 +395,29 @@ app.put('/api/clientes/:id', async (req, res) => {
   }
 });
 
-// Ruta DELETE: Eliminar un cliente y todos sus registros asociados (Entregas y Pagos)
+// Ruta DELETE: Eliminar un cliente.
+// No se borra la fila: se marca eliminado_en y deja de aparecer en la app. Sus entregas y pagos se conservan
+// porque son plata que realmente entró o se fió ese mes; si se borraran, cambiarían los totales de meses pasados.
 app.delete('/api/clientes/:id', async (req, res) => {
   const { id } = req.params;
   if (!esIdValido(id)) {
     return res.status(404).json({ error: 'Cliente no encontrado' });
   }
 
-  const client = await pool.connect();
-
   try {
-    // 1. Iniciamos una transacción para asegurar la integridad de los datos
-    await client.query('BEGIN');
-
-    // 2. Eliminamos las entregas asociadas a este cliente
-    await client.query('DELETE FROM entregas WHERE cliente_id = $1', [id]);
-
-    // 3. Eliminamos los pagos asociados a este cliente
-    await client.query('DELETE FROM pagos WHERE cliente_id = $1', [id]);
-
-    // 4. Finalmente, eliminamos al cliente de la tabla clientes
-    const result = await client.query('DELETE FROM clientes WHERE id = $1 RETURNING *;', [id]);
+    const result = await pool.query(
+      'UPDATE clientes SET eliminado_en = now() WHERE id = $1 AND eliminado_en IS NULL RETURNING *;',
+      [id]
+    );
 
     if (result.rows.length === 0) {
-      await rollbackSeguro(client);
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    // 5. Confirmamos la transacción
-    await client.query('COMMIT');
-
-    res.json({ mensaje: 'Cliente y sus registros asociados eliminados correctamente', cliente: result.rows[0] });
-
+    res.json({ mensaje: 'Cliente eliminado correctamente', cliente: result.rows[0] });
   } catch (err) {
-    // Si ocurre algún error, deshacemos todos los cambios
-    await rollbackSeguro(client);
     console.error('Error al eliminar el cliente:', err.message);
     res.status(500).send('Error en el servidor al eliminar el cliente');
-  } finally {
-    // Liberamos el cliente de la conexión
-    client.release();
   }
 });
 
@@ -445,7 +454,7 @@ app.post('/api/entregas', async (req, res) => {
       UPDATE clientes
       SET deuda_actual = deuda_actual + $1,
           fecha_ultima_entrega = CURRENT_DATE
-      WHERE id = $2;
+      WHERE id = $2 AND eliminado_en IS NULL;
     `;
     const resultadoCliente = await client.query(updateClienteQuery, [montoAdeudado, cliente_id]);
 
@@ -540,7 +549,7 @@ app.post('/api/pagos', async (req, res) => {
     const updateClienteQuery = `
       UPDATE clientes
       SET deuda_actual = deuda_actual - $1
-      WHERE id = $2
+      WHERE id = $2 AND eliminado_en IS NULL
       RETURNING *;
     `;
     const resultadoCliente = await client.query(updateClienteQuery, [montoPago, cliente_id]);
@@ -652,9 +661,9 @@ app.get('/api/finanzas/resumen', async (req, res) => {
       pool.query(`
         WITH mes AS (SELECT date_trunc('month', CURRENT_DATE)::date AS inicio)
         SELECT
-          (SELECT COUNT(*)::int FROM clientes) AS clientes_activos,
-          (SELECT COUNT(*)::int FROM clientes WHERE deuda_actual > 0) AS clientes_con_deuda,
-          (SELECT COALESCE(SUM(deuda_actual), 0) FROM clientes) AS dinero_en_la_calle,
+          (SELECT COUNT(*)::int FROM clientes WHERE eliminado_en IS NULL) AS clientes_activos,
+          (SELECT COUNT(*)::int FROM clientes WHERE eliminado_en IS NULL AND deuda_actual > 0) AS clientes_con_deuda,
+          (SELECT COALESCE(SUM(deuda_actual), 0) FROM clientes WHERE eliminado_en IS NULL) AS dinero_en_la_calle,
           (SELECT COALESCE(SUM(monto), 0) FROM gastos, mes
             WHERE fecha >= mes.inicio AND fecha < mes.inicio + INTERVAL '1 month') AS gastos_del_mes
       `),
@@ -717,6 +726,279 @@ app.get('/api/finanzas/resumen', async (req, res) => {
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Error al obtener el resumen financiero');
+  }
+});
+
+// ---------- Historial mensual de finanzas ----------
+// Cada pantalla de detalle recibe ?mes=AAAA-MM (o nada, para el mes actual) y devuelve:
+//   - meses: el resumen de todos los meses, desde el primero con datos hasta el actual
+//   - el detalle completo del mes pedido
+// Todo se calcula a partir de las entregas, pagos, gastos y clientes guardados, así que el historial
+// existe desde el primer registro y no hace falta "cerrar" los meses a mano.
+
+const MES_VALIDO = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+// Primer día del mes pedido, o del mes actual según la zona horaria del negocio
+const inicioDelMes = async (mes) => {
+  if (typeof mes === 'string' && MES_VALIDO.test(mes)) return `${mes}-01`;
+  const { rows } = await pool.query(`SELECT to_char(date_trunc('month', CURRENT_DATE), 'YYYY-MM-DD') AS inicio`);
+  return rows[0].inicio;
+};
+
+// Todos los meses desde el primer dato cargado hasta el actual (incluye meses sin movimientos)
+const SQL_MESES = `
+  meses AS (
+    SELECT generate_series(
+      date_trunc('month', LEAST(
+        (SELECT MIN(fecha) FROM entregas),
+        (SELECT MIN(COALESCE(fecha, creado_en::date)) FROM pagos),
+        (SELECT MIN(fecha) FROM gastos),
+        (SELECT MIN(creado_en)::date FROM clientes),
+        CURRENT_DATE
+      )),
+      date_trunc('month', CURRENT_DATE),
+      INTERVAL '1 month'
+    )::date AS mes
+  )`;
+
+// Movimientos que cambian la deuda de cada cliente: lo que quedó debiendo en cada entrega (+) y cada pago (-).
+// "inicial" es la deuda que no se explica con esos movimientos (por ejemplo, cargada a mano al crear el cliente);
+// se toma como existente desde el alta, así el saldo del mes actual coincide con deuda_actual.
+const SQL_DEUDA = `
+  mov AS (
+    SELECT cliente_id, fecha, COALESCE(monto_adeudado, 0) AS delta FROM entregas
+    UNION ALL
+    SELECT cliente_id, COALESCE(fecha, creado_en::date), -monto FROM pagos
+  ),
+  base AS (
+    SELECT c.id, c.nombre, c.creado_en, c.eliminado_en,
+           COALESCE(c.deuda_actual, 0) - COALESCE((SELECT SUM(delta) FROM mov WHERE mov.cliente_id = c.id), 0) AS inicial
+    FROM clientes c
+  )`;
+
+// Un cliente cuenta en un mes si ya estaba dado de alta y todavía no se había eliminado al cerrar ese mes
+const activoAlCierre = (alias, fin) =>
+  `(${alias}.creado_en IS NULL OR ${alias}.creado_en < ${fin}) AND (${alias}.eliminado_en IS NULL OR ${alias}.eliminado_en >= ${fin})`;
+
+const sinCreadoEn = (filas) => filas.map(({ creado_en, ...fila }) => fila);
+
+// Ruta GET: Ingresos por mes (ventas cobradas al entregar + cobros de deuda) y el detalle de un mes
+app.get('/api/finanzas/ingresos', async (req, res) => {
+  try {
+    const inicio = await inicioDelMes(req.query.mes);
+    const [meses, movimientos] = await Promise.all([
+      pool.query(`
+        WITH ${SQL_MESES},
+        ingresos AS (
+          SELECT date_trunc('month', fecha)::date AS mes, COALESCE(monto_pagado, 0) AS ventas, 0 AS cobros FROM entregas
+          UNION ALL
+          SELECT date_trunc('month', COALESCE(fecha, creado_en::date))::date, 0, monto FROM pagos
+        )
+        SELECT to_char(m.mes, 'YYYY-MM') AS mes,
+               COALESCE(SUM(i.ventas), 0) AS ventas,
+               COALESCE(SUM(i.cobros), 0) AS cobros,
+               COALESCE(SUM(i.ventas + i.cobros), 0) AS total
+        FROM meses m
+        LEFT JOIN ingresos i ON i.mes = m.mes
+        GROUP BY m.mes
+        ORDER BY m.mes DESC
+      `),
+      pool.query(`
+        SELECT * FROM (
+          SELECT 'venta' AS tipo, e.id, to_char(e.fecha, 'YYYY-MM-DD') AS fecha, e.creado_en,
+                 e.monto_pagado AS monto, e.cantidad_bidones, e.cliente_id,
+                 c.nombre AS cliente_nombre, c.eliminado_en IS NOT NULL AS cliente_eliminado
+          FROM entregas e LEFT JOIN clientes c ON c.id = e.cliente_id
+          WHERE e.monto_pagado > 0 AND e.fecha >= $1::date AND e.fecha < $1::date + INTERVAL '1 month'
+          UNION ALL
+          SELECT 'cobro', p.id, to_char(COALESCE(p.fecha, p.creado_en::date), 'YYYY-MM-DD'), p.creado_en,
+                 p.monto, NULL, p.cliente_id, c.nombre, c.eliminado_en IS NOT NULL
+          FROM pagos p LEFT JOIN clientes c ON c.id = p.cliente_id
+          WHERE COALESCE(p.fecha, p.creado_en::date) >= $1::date
+            AND COALESCE(p.fecha, p.creado_en::date) < $1::date + INTERVAL '1 month'
+        ) m
+        ORDER BY fecha DESC, creado_en DESC NULLS LAST
+      `, [inicio])
+    ]);
+
+    res.json({ mes: inicio.slice(0, 7), meses: meses.rows, movimientos: sinCreadoEn(movimientos.rows) });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de ingresos');
+  }
+});
+
+// Ruta GET: Gastos por mes, por categoría y el detalle de un mes
+app.get('/api/finanzas/gastos', async (req, res) => {
+  try {
+    const inicio = await inicioDelMes(req.query.mes);
+    const delMes = `fecha >= $1::date AND fecha < $1::date + INTERVAL '1 month'`;
+    const [meses, categorias, gastos] = await Promise.all([
+      pool.query(`
+        WITH ${SQL_MESES}
+        SELECT to_char(m.mes, 'YYYY-MM') AS mes, COALESCE(SUM(g.monto), 0) AS total, COUNT(g.id)::int AS cantidad
+        FROM meses m
+        LEFT JOIN gastos g ON date_trunc('month', g.fecha)::date = m.mes
+        GROUP BY m.mes
+        ORDER BY m.mes DESC
+      `),
+      pool.query(`
+        SELECT COALESCE(NULLIF(categoria, ''), 'Varios') AS categoria, SUM(monto) AS total, COUNT(*)::int AS cantidad
+        FROM gastos
+        WHERE ${delMes}
+        GROUP BY 1
+        ORDER BY total DESC
+      `, [inicio]),
+      pool.query(`
+        SELECT id, to_char(fecha, 'YYYY-MM-DD') AS fecha, categoria, descripcion, monto
+        FROM gastos
+        WHERE ${delMes}
+        ORDER BY fecha DESC, creado_en DESC, id DESC
+      `, [inicio])
+    ]);
+
+    res.json({ mes: inicio.slice(0, 7), meses: meses.rows, categorias: categorias.rows, gastos: gastos.rows });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de gastos');
+  }
+});
+
+// Ruta GET: Dinero en la calle por mes (saldo al cierre, lo fiado y lo cobrado) y el detalle de un mes
+app.get('/api/finanzas/deuda', async (req, res) => {
+  try {
+    const inicio = await inicioDelMes(req.query.mes);
+    const finMes = `$1::date + INTERVAL '1 month'`;
+    const [meses, deudores, movimientos] = await Promise.all([
+      pool.query(`
+        WITH ${SQL_MESES}, ${SQL_DEUDA},
+        entregas_mes AS (
+          SELECT date_trunc('month', fecha)::date AS mes,
+                 SUM(GREATEST(COALESCE(monto_adeudado, 0), 0)) AS fiado,
+                 -- Si en una entrega pagó de más, ese excedente se descontó de su deuda: cuenta como cobro
+                 SUM(GREATEST(-COALESCE(monto_adeudado, 0), 0)) AS cobrado_en_entregas
+          FROM entregas GROUP BY 1
+        ),
+        pagos_mes AS (
+          SELECT date_trunc('month', COALESCE(fecha, creado_en::date))::date AS mes, SUM(monto) AS cobrado
+          FROM pagos GROUP BY 1
+        ),
+        -- Deuda que dejaron de contar los clientes eliminados ese mes (su deuda_actual queda congelada al eliminarlos).
+        -- Explica por qué el saldo baja sin que se haya cobrado: saldo anterior + fiado - cobrado - esto = saldo al cierre
+        bajas_mes AS (
+          SELECT date_trunc('month', eliminado_en)::date AS mes, SUM(COALESCE(deuda_actual, 0)) AS deuda_eliminada
+          FROM clientes WHERE eliminado_en IS NOT NULL GROUP BY 1
+        )
+        SELECT to_char(m.mes, 'YYYY-MM') AS mes,
+               COALESCE(em.fiado, 0) AS fiado,
+               COALESCE(pm.cobrado, 0) + COALESCE(em.cobrado_en_entregas, 0) AS cobrado,
+               COALESCE(bm.deuda_eliminada, 0) AS deuda_eliminada,
+               (SELECT COALESCE(SUM(b.inicial + COALESCE((
+                         SELECT SUM(mv.delta) FROM mov mv
+                         WHERE mv.cliente_id = b.id AND mv.fecha < m.mes + INTERVAL '1 month'), 0)), 0)
+                FROM base b
+                WHERE ${activoAlCierre('b', "m.mes + INTERVAL '1 month'")}) AS saldo_cierre
+        FROM meses m
+        LEFT JOIN entregas_mes em ON em.mes = m.mes
+        LEFT JOIN pagos_mes pm ON pm.mes = m.mes
+        LEFT JOIN bajas_mes bm ON bm.mes = m.mes
+        ORDER BY m.mes DESC
+      `),
+      // Quiénes debían (y cuánto) al cerrar el mes pedido
+      pool.query(`
+        WITH ${SQL_DEUDA}
+        SELECT * FROM (
+          SELECT b.id, b.nombre, b.eliminado_en IS NOT NULL AS eliminado,
+                 b.inicial + COALESCE((SELECT SUM(mv.delta) FROM mov mv
+                                       WHERE mv.cliente_id = b.id AND mv.fecha < ${finMes}), 0) AS saldo
+          FROM base b
+          WHERE ${activoAlCierre('b', finMes)}
+        ) d
+        WHERE saldo > 0
+        ORDER BY saldo DESC, nombre
+      `, [inicio]),
+      pool.query(`
+        SELECT * FROM (
+          SELECT CASE WHEN e.monto_adeudado > 0 THEN 'fiado' ELSE 'pago_de_mas' END AS tipo,
+                 e.id, to_char(e.fecha, 'YYYY-MM-DD') AS fecha, e.creado_en,
+                 ABS(e.monto_adeudado) AS monto, e.cantidad_bidones, e.cliente_id,
+                 c.nombre AS cliente_nombre, c.eliminado_en IS NOT NULL AS cliente_eliminado
+          FROM entregas e LEFT JOIN clientes c ON c.id = e.cliente_id
+          WHERE e.monto_adeudado <> 0 AND e.fecha >= $1::date AND e.fecha < ${finMes}
+          UNION ALL
+          SELECT 'cobro', p.id, to_char(COALESCE(p.fecha, p.creado_en::date), 'YYYY-MM-DD'), p.creado_en,
+                 p.monto, NULL, p.cliente_id, c.nombre, c.eliminado_en IS NOT NULL
+          FROM pagos p LEFT JOIN clientes c ON c.id = p.cliente_id
+          WHERE COALESCE(p.fecha, p.creado_en::date) >= $1::date
+            AND COALESCE(p.fecha, p.creado_en::date) < ${finMes}
+        ) m
+        ORDER BY fecha DESC, creado_en DESC NULLS LAST
+      `, [inicio])
+    ]);
+
+    res.json({
+      mes: inicio.slice(0, 7),
+      meses: meses.rows,
+      deudores: deudores.rows,
+      movimientos: sinCreadoEn(movimientos.rows)
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de deuda');
+  }
+});
+
+// Ruta GET: Clientes por mes (activos, altas, bajas, atendidos, bidones) y el detalle de un mes
+app.get('/api/finanzas/clientes', async (req, res) => {
+  try {
+    const inicio = await inicioDelMes(req.query.mes);
+    const enElMes = (fecha) => `${fecha} >= m.mes AND ${fecha} < m.mes + INTERVAL '1 month'`;
+    const [meses, atendidos, altas, bajas] = await Promise.all([
+      pool.query(`
+        WITH ${SQL_MESES}
+        SELECT to_char(m.mes, 'YYYY-MM') AS mes,
+               (SELECT COUNT(*)::int FROM clientes c WHERE ${activoAlCierre('c', "m.mes + INTERVAL '1 month'")}) AS activos,
+               (SELECT COUNT(*)::int FROM clientes c WHERE ${enElMes('c.creado_en')}) AS nuevos,
+               (SELECT COUNT(*)::int FROM clientes c WHERE ${enElMes('c.eliminado_en')}) AS bajas,
+               (SELECT COUNT(DISTINCT e.cliente_id)::int FROM entregas e WHERE ${enElMes('e.fecha')}) AS atendidos,
+               (SELECT COUNT(*)::int FROM entregas e WHERE ${enElMes('e.fecha')}) AS entregas,
+               (SELECT COALESCE(SUM(e.cantidad_bidones), 0)::int FROM entregas e WHERE ${enElMes('e.fecha')}) AS bidones
+        FROM meses m
+        ORDER BY m.mes DESC
+      `),
+      pool.query(`
+        SELECT e.cliente_id AS id, c.nombre, c.eliminado_en IS NOT NULL AS eliminado,
+               COUNT(*)::int AS entregas, SUM(e.cantidad_bidones)::int AS bidones,
+               COALESCE(SUM(e.monto_pagado), 0) AS pagado
+        FROM entregas e LEFT JOIN clientes c ON c.id = e.cliente_id
+        WHERE e.fecha >= $1::date AND e.fecha < $1::date + INTERVAL '1 month'
+        GROUP BY e.cliente_id, c.nombre, c.eliminado_en
+        ORDER BY bidones DESC, c.nombre
+      `, [inicio]),
+      pool.query(`
+        SELECT id, nombre, to_char(creado_en, 'YYYY-MM-DD') AS fecha, eliminado_en IS NOT NULL AS eliminado
+        FROM clientes
+        WHERE creado_en >= $1::date AND creado_en < $1::date + INTERVAL '1 month'
+        ORDER BY creado_en DESC
+      `, [inicio]),
+      pool.query(`
+        SELECT id, nombre, to_char(eliminado_en, 'YYYY-MM-DD') AS fecha, true AS eliminado
+        FROM clientes
+        WHERE eliminado_en >= $1::date AND eliminado_en < $1::date + INTERVAL '1 month'
+        ORDER BY eliminado_en DESC
+      `, [inicio])
+    ]);
+
+    res.json({
+      mes: inicio.slice(0, 7),
+      meses: meses.rows,
+      atendidos: atendidos.rows,
+      altas: altas.rows,
+      bajas: bajas.rows
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener el historial de clientes');
   }
 });
 
