@@ -764,16 +764,24 @@ const SQL_MESES = `
 // Movimientos que cambian la deuda de cada cliente: lo que quedó debiendo en cada entrega (+) y cada pago (-).
 // "inicial" es la deuda que no se explica con esos movimientos (por ejemplo, cargada a mano al crear el cliente);
 // se toma como existente desde el alta, así el saldo del mes actual coincide con deuda_actual.
+// Importante para el rendimiento: los movimientos se agrupan una sola vez por cliente y por mes, en lugar de
+// recorrerlos de nuevo para cada cliente y cada mes (con 10 años de datos eso tardaba más de un minuto).
 const SQL_DEUDA = `
   mov AS (
     SELECT cliente_id, fecha, COALESCE(monto_adeudado, 0) AS delta FROM entregas
     UNION ALL
     SELECT cliente_id, COALESCE(fecha, creado_en::date), -monto FROM pagos
   ),
+  -- Cambio neto de la deuda de cada cliente en cada mes
+  mov_mes AS (
+    SELECT cliente_id, date_trunc('month', fecha)::date AS mes, SUM(delta) AS delta
+    FROM mov GROUP BY 1, 2
+  ),
   base AS (
     SELECT c.id, c.nombre, c.creado_en, c.eliminado_en,
-           COALESCE(c.deuda_actual, 0) - COALESCE((SELECT SUM(delta) FROM mov WHERE mov.cliente_id = c.id), 0) AS inicial
+           COALESCE(c.deuda_actual, 0) - COALESCE(t.total, 0) AS inicial
     FROM clientes c
+    LEFT JOIN (SELECT cliente_id, SUM(delta) AS total FROM mov_mes GROUP BY 1) t ON t.cliente_id = c.id
   )`;
 
 // Un cliente cuenta en un mes si ya estaba dado de alta y todavía no se había eliminado al cerrar ese mes
@@ -888,30 +896,44 @@ app.get('/api/finanzas/deuda', async (req, res) => {
         bajas_mes AS (
           SELECT date_trunc('month', eliminado_en)::date AS mes, SUM(COALESCE(deuda_actual, 0)) AS deuda_eliminada
           FROM clientes WHERE eliminado_en IS NOT NULL GROUP BY 1
+        ),
+        -- Saldo de cada cliente al cierre de cada mes: su deuda inicial + la suma acumulada de sus cambios mensuales
+        saldos AS (
+          SELECT b.creado_en, b.eliminado_en, m.mes,
+                 b.inicial + SUM(COALESCE(mm.delta, 0)) OVER (PARTITION BY b.id ORDER BY m.mes) AS saldo
+          FROM base b
+          CROSS JOIN meses m
+          LEFT JOIN mov_mes mm ON mm.cliente_id = b.id AND mm.mes = m.mes
+        ),
+        saldo_mes AS (
+          SELECT s.mes, SUM(s.saldo) AS saldo_cierre
+          FROM saldos s
+          WHERE ${activoAlCierre('s', "s.mes + INTERVAL '1 month'")}
+          GROUP BY s.mes
         )
         SELECT to_char(m.mes, 'YYYY-MM') AS mes,
                COALESCE(em.fiado, 0) AS fiado,
                COALESCE(pm.cobrado, 0) + COALESCE(em.cobrado_en_entregas, 0) AS cobrado,
                COALESCE(bm.deuda_eliminada, 0) AS deuda_eliminada,
-               (SELECT COALESCE(SUM(b.inicial + COALESCE((
-                         SELECT SUM(mv.delta) FROM mov mv
-                         WHERE mv.cliente_id = b.id AND mv.fecha < m.mes + INTERVAL '1 month'), 0)), 0)
-                FROM base b
-                WHERE ${activoAlCierre('b', "m.mes + INTERVAL '1 month'")}) AS saldo_cierre
+               COALESCE(sm.saldo_cierre, 0) AS saldo_cierre
         FROM meses m
         LEFT JOIN entregas_mes em ON em.mes = m.mes
         LEFT JOIN pagos_mes pm ON pm.mes = m.mes
         LEFT JOIN bajas_mes bm ON bm.mes = m.mes
+        LEFT JOIN saldo_mes sm ON sm.mes = m.mes
         ORDER BY m.mes DESC
       `),
       // Quiénes debían (y cuánto) al cerrar el mes pedido
       pool.query(`
-        WITH ${SQL_DEUDA}
+        WITH ${SQL_DEUDA},
+        hasta_fin AS (
+          SELECT cliente_id, SUM(delta) AS delta FROM mov_mes WHERE mes < ${finMes} GROUP BY 1
+        )
         SELECT * FROM (
           SELECT b.id, b.nombre, b.eliminado_en IS NOT NULL AS eliminado,
-                 b.inicial + COALESCE((SELECT SUM(mv.delta) FROM mov mv
-                                       WHERE mv.cliente_id = b.id AND mv.fecha < ${finMes}), 0) AS saldo
+                 b.inicial + COALESCE(h.delta, 0) AS saldo
           FROM base b
+          LEFT JOIN hasta_fin h ON h.cliente_id = b.id
           WHERE ${activoAlCierre('b', finMes)}
         ) d
         WHERE saldo > 0
