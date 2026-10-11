@@ -61,6 +61,8 @@ const prepararBaseDeDatos = async () => {
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS barrio VARCHAR(100);
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS latitud NUMERIC;
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS longitud NUMERIC;
+    -- Apodo opcional para encontrar al cliente más fácil. Los avisos por WhatsApp siguen usando el nombre.
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS apodo VARCHAR(100);
     -- Borrado lógico: al eliminar un cliente se marca la fecha en vez de borrar la fila,
     -- así sus entregas y pagos siguen contando en el historial de finanzas
     ALTER TABLE clientes ADD COLUMN IF NOT EXISTS eliminado_en TIMESTAMPTZ;
@@ -223,7 +225,7 @@ app.get('/api/clientes', async (req, res) => {
 app.post('/api/clientes', async (req, res) => {
   try {
     // 1. Extraemos los datos que nos envía el frontend
-    const { nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud } = req.body;
+    const { nombre, apodo, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud } = req.body;
 
     // 2. Validación básica: asegurarnos de que al menos envíen el nombre
     if (!nombre || !String(nombre).trim()) {
@@ -233,8 +235,8 @@ app.post('/api/clientes', async (req, res) => {
     // 3. Consulta SQL parametrizada (Los $1, $2 evitan hackeos por inyección SQL)
     // RETURNING * le dice a Postgres que nos devuelva toda la fila recién creada
     const query = `
-      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud, apodo)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *;
     `;
 
@@ -247,7 +249,8 @@ app.post('/api/clientes', async (req, res) => {
       consumo && consumo > 0 ? Math.round(consumo) : 1,
       vacioANull(barrio),
       aNumero(latitud),
-      aNumero(longitud)
+      aNumero(longitud),
+      vacioANull(String(apodo ?? '').trim())
     ];
 
     // 4. Ejecutamos la consulta en la base de datos
@@ -349,6 +352,8 @@ app.put('/api/clientes/:id', async (req, res) => {
     }
     agregar('nombre', nombre);
   }
+
+  if ('apodo' in body) agregar('apodo', vacioANull(String(body.apodo ?? '').trim()));
 
   for (const columna of ['direccion', 'telefono', 'barrio']) {
     if (columna in body) agregar(columna, vacioANull(body[columna]));
