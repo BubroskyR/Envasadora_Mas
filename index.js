@@ -74,6 +74,17 @@ const prepararBaseDeDatos = async () => {
     CREATE INDEX IF NOT EXISTS idx_pagos_fecha ON pagos (fecha DESC);
     CREATE INDEX IF NOT EXISTS idx_gastos_fecha ON gastos (fecha DESC);
 
+    -- Identificador que genera el teléfono para cada carga (la app primero guarda en el teléfono y después envía).
+    -- Si la señal se corta justo mientras se envía, el reintento trae el mismo id_local y no se registra dos veces.
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS id_local VARCHAR(64);
+    ALTER TABLE entregas ADD COLUMN IF NOT EXISTS id_local VARCHAR(64);
+    ALTER TABLE pagos ADD COLUMN IF NOT EXISTS id_local VARCHAR(64);
+    ALTER TABLE gastos ADD COLUMN IF NOT EXISTS id_local VARCHAR(64);
+    CREATE UNIQUE INDEX IF NOT EXISTS clientes_id_local_unico ON clientes (id_local);
+    CREATE UNIQUE INDEX IF NOT EXISTS entregas_id_local_unico ON entregas (id_local);
+    CREATE UNIQUE INDEX IF NOT EXISTS pagos_id_local_unico ON pagos (id_local);
+    CREATE UNIQUE INDEX IF NOT EXISTS gastos_id_local_unico ON gastos (id_local);
+
     -- creado_en era "timestamp sin zona": guardaba la hora en la zona de cada conexión, así que los
     -- registros viejos (en UTC) y los nuevos (hora argentina) no se podían comparar y el historial
     -- de finanzas quedaba desordenado. Con timestamptz se guarda el instante exacto.
@@ -95,9 +106,19 @@ const prepararBaseDeDatos = async () => {
   `);
 };
 
+// Estado de la preparación de la base al arrancar. Se informa en /api/salud para poder comprobar,
+// sin entrar a Render, que las columnas e índices nuevos se crearon bien después de publicar.
+let estadoBase = 'preparando';
+
 prepararBaseDeDatos()
-  .then(() => console.log('✅ Conectado exitosamente a PostgreSQL (estructura verificada)'))
-  .catch(err => console.error('❌ Error al conectar o preparar la base de datos', err.stack));
+  .then(() => {
+    estadoBase = 'lista';
+    console.log('✅ Conectado exitosamente a PostgreSQL (estructura verificada)');
+  })
+  .catch(err => {
+    estadoBase = 'error';
+    console.error('❌ Error al conectar o preparar la base de datos', err.stack);
+  });
 
 // ---------- Helpers ----------
 
@@ -113,6 +134,23 @@ const aNumero = (valor) => {
 
 // Los IDs son enteros positivos. Validarlos evita que Postgres tire un error 500 con "/api/clientes/abc".
 const esIdValido = (id) => /^\d+$/.test(String(id));
+
+// Identificador que genera el teléfono para cada carga (ver id_local en prepararBaseDeDatos)
+const idLocalValido = (valor) => (typeof valor === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(valor) ? valor : null);
+
+// Fecha en que se cargó el movimiento en el teléfono: si se cargó sin conexión puede ser de un día anterior.
+// Devuelve 'AAAA-MM-DD', o null si no vino o no es una fecha real (ej. 2026-02-30).
+const fechaValida = (valor) => {
+  if (typeof valor !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(valor)) return null;
+  const [anio, mes, dia] = valor.split('-').map(Number);
+  const fecha = new Date(Date.UTC(anio, mes - 1, dia));
+  return fecha.getUTCFullYear() === anio && fecha.getUTCMonth() === mes - 1 && fecha.getUTCDate() === dia ? valor : null;
+};
+
+// En SQL: la fecha enviada (o hoy si no vino), pero nunca en el futuro ni más de 90 días atrás,
+// por si el reloj del teléfono está mal configurado.
+const sqlFechaMovimiento = (parametro) =>
+  `LEAST(GREATEST(COALESCE(${parametro}::date, CURRENT_DATE), CURRENT_DATE - 90), CURRENT_DATE)`;
 
 // Hace ROLLBACK sin que un fallo del propio ROLLBACK (ej. conexión caída) tape el error original.
 const rollbackSeguro = async (client) => {
@@ -196,6 +234,13 @@ app.post('/api/login', (req, res) => {
   res.json({ token: crearToken(), expira_en_dias: DURACION_TOKEN_MS / (24 * 60 * 60 * 1000) });
 });
 
+// Ruta GET: Comprobar que el servidor responde. La app la usa para saber cuándo volvió la conexión
+// y enviar lo que se cargó sin señal. No requiere sesión ni toca la base de datos.
+// "base" dice cómo terminó la preparación de la base al arrancar: 'preparando', 'lista' o 'error'.
+app.get('/api/salud', (req, res) => {
+  res.json({ ok: true, base: estadoBase });
+});
+
 // Todas las rutas /api definidas DESPUÉS de este middleware requieren un token válido
 app.use('/api', (req, res, next) => {
   if (!APP_PASSWORD) {
@@ -233,10 +278,13 @@ app.post('/api/clientes', async (req, res) => {
     }
 
     // 3. Consulta SQL parametrizada (Los $1, $2 evitan hackeos por inyección SQL)
-    // RETURNING * le dice a Postgres que nos devuelva toda la fila recién creada
+    // RETURNING * le dice a Postgres que nos devuelva toda la fila recién creada.
+    // Si ya existe un cliente con el mismo id_local, es un reintento desde el teléfono: no se crea otro.
+    const idLocal = idLocalValido(req.body.id_local);
     const query = `
-      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud, apodo)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud, apodo, id_local)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (id_local) DO NOTHING
       RETURNING *;
     `;
 
@@ -250,11 +298,18 @@ app.post('/api/clientes', async (req, res) => {
       vacioANull(barrio),
       aNumero(latitud),
       aNumero(longitud),
-      vacioANull(String(apodo ?? '').trim())
+      vacioANull(String(apodo ?? '').trim()),
+      idLocal
     ];
 
     // 4. Ejecutamos la consulta en la base de datos
     const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      // Reintento de un cliente que ya se había creado: se devuelve el existente
+      const existente = await pool.query('SELECT * FROM clientes WHERE id_local = $1', [idLocal]);
+      return res.status(200).json(existente.rows[0]);
+    }
 
     // 5. Respondemos con el cliente creado y un código 201 (Created)
     res.status(201).json(result.rows[0]);
@@ -445,6 +500,9 @@ app.post('/api/entregas', async (req, res) => {
 
   // Lo que no se pagó queda como deuda. Si paga de más, la diferencia (negativa) reduce su deuda.
   const montoAdeudado = montoTotal - montoPagado;
+  // Si la entrega se cargó sin conexión, llega con la fecha en que se hizo y su id_local (ver idLocalValido)
+  const fecha = fechaValida(req.body.fecha);
+  const idLocal = idLocalValido(req.body.id_local);
 
   // Pedimos un "cliente" temporal a la base de datos para manejar la transacción
   const client = await pool.connect();
@@ -453,30 +511,46 @@ app.post('/api/entregas', async (req, res) => {
     // 1. Iniciamos la transacción
     await client.query('BEGIN');
 
-    // 2. Actualizamos al cliente: Sumamos la nueva deuda y actualizamos su última entrega.
-    // Lo hacemos primero para saber si el cliente existe antes de insertar nada.
-    const updateClienteQuery = `
-      UPDATE clientes
-      SET deuda_actual = deuda_actual + $1,
-          fecha_ultima_entrega = CURRENT_DATE
-      WHERE id = $2 AND eliminado_en IS NULL;
-    `;
-    const resultadoCliente = await client.query(updateClienteQuery, [montoAdeudado, cliente_id]);
-
-    if (resultadoCliente.rowCount === 0) {
+    // 2. Bloqueamos la fila del cliente: si llegan dos envíos de la misma entrega a la vez (reintentos con
+    // mala señal), el segundo espera a que termine el primero y no se suma la deuda dos veces.
+    const cliente = await client.query('SELECT eliminado_en FROM clientes WHERE id = $1 FOR UPDATE', [cliente_id]);
+    if (cliente.rows.length === 0) {
       await rollbackSeguro(client);
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    // 3. Insertamos la nueva entrega en el historial (usamos CURRENT_DATE para la fecha de hoy)
+    // 3. Insertamos la entrega en el historial. Si ya existe una con el mismo id_local, es un reintento:
+    // se responde con la que ya estaba, sin tocar la deuda.
     const insertEntregaQuery = `
-      INSERT INTO entregas (cliente_id, fecha, cantidad_bidones, monto_pagado, monto_adeudado)
-      VALUES ($1, CURRENT_DATE, $2, $3, $4)
+      INSERT INTO entregas (cliente_id, fecha, cantidad_bidones, monto_pagado, monto_adeudado, id_local)
+      VALUES ($1, ${sqlFechaMovimiento('$5')}, $2, $3, $4, $6)
+      ON CONFLICT (id_local) DO NOTHING
       RETURNING *;
     `;
-    const resultadoEntrega = await client.query(insertEntregaQuery, [cliente_id, cantidad, montoPagado, montoAdeudado]);
+    const resultadoEntrega = await client.query(insertEntregaQuery, [cliente_id, cantidad, montoPagado, montoAdeudado, fecha, idLocal]);
 
-    // 4. Confirmamos que todo salió bien y guardamos los cambios
+    if (resultadoEntrega.rows.length === 0) {
+      const existente = await client.query('SELECT * FROM entregas WHERE id_local = $1', [idLocal]);
+      await client.query('COMMIT');
+      return res.status(200).json({ mensaje: 'La entrega ya estaba registrada', entrega: existente.rows[0], repetida: true });
+    }
+
+    if (cliente.rows[0].eliminado_en) {
+      await rollbackSeguro(client);
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
+    // 4. Sumamos la nueva deuda y actualizamos su última entrega. Si la entrega es de un día anterior
+    // (cargada sin conexión), no pisa una fecha de última entrega más reciente.
+    await client.query(`
+      UPDATE clientes c
+      SET deuda_actual = c.deuda_actual + $1,
+          fecha_ultima_entrega = GREATEST(COALESCE(c.fecha_ultima_entrega, e.fecha), e.fecha)
+      FROM entregas e
+      WHERE e.id = $2 AND c.id = $3;
+    `, [montoAdeudado, resultadoEntrega.rows[0].id, cliente_id]);
+
+    // 5. Confirmamos que todo salió bien y guardamos los cambios
     await client.query('COMMIT');
 
     // Devolvemos los datos de la entrega recién creada
@@ -545,32 +619,53 @@ app.post('/api/pagos', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos obligatorios (cliente_id, monto_pago)' });
   }
 
+  // Si el pago se cargó sin conexión, llega con la fecha en que se hizo y su id_local (ver idLocalValido)
+  const fecha = fechaValida(req.body.fecha);
+  const idLocal = idLocalValido(req.body.id_local);
+
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN'); // Iniciamos la transacción
 
-    // 1. Descontar la deuda del perfil del cliente (y de paso verificar que exista)
-    const updateClienteQuery = `
-      UPDATE clientes
-      SET deuda_actual = deuda_actual - $1
-      WHERE id = $2 AND eliminado_en IS NULL
-      RETURNING *;
-    `;
-    const resultadoCliente = await client.query(updateClienteQuery, [montoPago, cliente_id]);
-
-    if (resultadoCliente.rows.length === 0) {
+    // 1. Bloqueamos al cliente (y verificamos que exista) para que dos reintentos del mismo pago no descuenten dos veces
+    const cliente = await client.query('SELECT eliminado_en FROM clientes WHERE id = $1 FOR UPDATE', [cliente_id]);
+    if (cliente.rows.length === 0) {
       await rollbackSeguro(client);
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    // 2. Guardar el registro en el historial de pagos
+    // 2. Guardar el registro en el historial de pagos. Si ya existe uno con el mismo id_local, es un reintento.
     const insertPagoQuery = `
-      INSERT INTO pagos (cliente_id, monto, metodo_pago)
-      VALUES ($1, $2, $3)
+      INSERT INTO pagos (cliente_id, monto, metodo_pago, fecha, id_local)
+      VALUES ($1, $2, $3, ${sqlFechaMovimiento('$4')}, $5)
+      ON CONFLICT (id_local) DO NOTHING
       RETURNING *;
     `;
-    const resultadoPago = await client.query(insertPagoQuery, [cliente_id, montoPago, metodo_pago || 'Efectivo']);
+    const resultadoPago = await client.query(insertPagoQuery, [cliente_id, montoPago, metodo_pago || 'Efectivo', fecha, idLocal]);
+
+    if (resultadoPago.rows.length === 0) {
+      const existente = await client.query('SELECT * FROM pagos WHERE id_local = $1', [idLocal]);
+      const actual = await client.query('SELECT * FROM clientes WHERE id = $1', [cliente_id]);
+      await client.query('COMMIT');
+      return res.status(200).json({
+        mensaje: 'El pago ya estaba registrado',
+        pago_registrado: existente.rows[0],
+        cliente_actualizado: actual.rows[0],
+        repetido: true
+      });
+    }
+
+    if (cliente.rows[0].eliminado_en) {
+      await rollbackSeguro(client);
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
+    // 3. Descontar la deuda del perfil del cliente
+    const resultadoCliente = await client.query(
+      'UPDATE clientes SET deuda_actual = deuda_actual - $1 WHERE id = $2 RETURNING *;',
+      [montoPago, cliente_id]
+    );
 
     await client.query('COMMIT'); // Confirmamos los cambios
 
@@ -619,18 +714,26 @@ app.post('/api/gastos', async (req, res) => {
       return res.status(400).json({ error: 'La categoría y el monto son obligatorios' });
     }
 
-    // 3. Consulta SQL: Insertamos el gasto (usamos CURRENT_DATE para la fecha de hoy)
+    // 3. Consulta SQL: Insertamos el gasto con la fecha en que se cargó (hoy, o un día anterior si se cargó
+    // sin conexión). Si ya existe uno con el mismo id_local, es un reintento desde el teléfono.
+    const idLocal = idLocalValido(req.body.id_local);
     const query = `
-      INSERT INTO gastos (fecha, categoria, monto, descripcion)
-      VALUES (CURRENT_DATE, $1, $2, $3)
+      INSERT INTO gastos (fecha, categoria, monto, descripcion, id_local)
+      VALUES (${sqlFechaMovimiento('$4')}, $1, $2, $3, $5)
+      ON CONFLICT (id_local) DO NOTHING
       RETURNING *;
     `;
 
     // Si no hay descripción, mandamos un texto vacío
-    const values = [categoria, monto, descripcion || ''];
+    const values = [categoria, monto, descripcion || '', fechaValida(req.body.fecha), idLocal];
 
     // 4. Ejecutamos la consulta
     const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      const existente = await pool.query('SELECT * FROM gastos WHERE id_local = $1', [idLocal]);
+      return res.status(200).json({ mensaje: 'El gasto ya estaba registrado', gasto: existente.rows[0], repetido: true });
+    }
 
     // 5. Respondemos con éxito
     res.status(201).json({
