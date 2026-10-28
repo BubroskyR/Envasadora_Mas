@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const cors = require('cors');
 const { PERIODOS_DIAS, BIDONES_MAXIMOS, consumoValido, semanalDerivado, calcularAjuste } = require('./consumo');
+const { normalizarAjustes } = require('./ajustes');
 require('dotenv').config();
 
 const app = express();
@@ -104,6 +105,16 @@ const prepararBaseDeDatos = async () => {
     ALTER TABLE clientes ALTER COLUMN consumo_bidones SET NOT NULL;
     ALTER TABLE clientes ALTER COLUMN consumo_dias SET DEFAULT 7;
     ALTER TABLE clientes ALTER COLUMN consumo_dias SET NOT NULL;
+
+    -- Ajustes de la app (precio del bidón, barrios de reparto y código de área), iguales en todos los teléfonos.
+    -- Antes se guardaban solo en cada teléfono. Hay una sola fila, la de id 1 (ver ajustes.js).
+    CREATE TABLE IF NOT EXISTS ajustes (
+      id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      precio_bidon NUMERIC NOT NULL,
+      barrios TEXT[] NOT NULL,
+      codigo_area VARCHAR(4) NOT NULL,
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
 
     -- creado_en era "timestamp sin zona": guardaba la hora en la zona de cada conexión, así que los
     -- registros viejos (en UTC) y los nuevos (hora argentina) no se podían comparar y el historial
@@ -881,6 +892,57 @@ app.get('/api/gastos', async (req, res) => {
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Error al obtener los gastos');
+  }
+});
+
+// ---------- Ajustes ----------
+
+const COLUMNAS_AJUSTES = 'precio_bidon, barrios, codigo_area, actualizado_en';
+
+// Ruta GET: Obtener los ajustes (precio del bidón, barrios de reparto y código de área).
+// Devuelve null si nunca se guardaron: la app usa los valores de fábrica.
+app.get('/api/ajustes', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT ${COLUMNAS_AJUSTES} FROM ajustes WHERE id = 1`);
+    res.json(result.rows[0] ?? null);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error al obtener los ajustes');
+  }
+});
+
+// Ruta PUT: Guardar los ajustes. Con "inicial": true solo se guardan si todavía no había ninguno:
+// así cada teléfono sube los ajustes que tenía guardados de antes sin pisar los que ya se cambiaron
+// desde otro teléfono.
+app.put('/api/ajustes', async (req, res) => {
+  const { ajustes, error } = normalizarAjustes(req.body);
+  if (error) {
+    return res.status(400).json({ error });
+  }
+
+  try {
+    const { precio_bidon, barrios, codigo_area } = ajustes;
+    const result = await pool.query(`
+      INSERT INTO ajustes (id, precio_bidon, barrios, codigo_area)
+      VALUES (1, $1, $2, $3)
+      ON CONFLICT (id) DO UPDATE
+        SET precio_bidon = EXCLUDED.precio_bidon,
+            barrios = EXCLUDED.barrios,
+            codigo_area = EXCLUDED.codigo_area,
+            actualizado_en = now()
+        WHERE NOT $4
+      RETURNING ${COLUMNAS_AJUSTES};
+    `, [precio_bidon, barrios, codigo_area, req.body.inicial === true]);
+
+    if (result.rows.length === 0) {
+      // Era la subida inicial y ya había ajustes guardados: se devuelven los que quedaron
+      const existentes = await pool.query(`SELECT ${COLUMNAS_AJUSTES} FROM ajustes WHERE id = 1`);
+      return res.json(existentes.rows[0]);
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error en el servidor al guardar los ajustes');
   }
 });
 
