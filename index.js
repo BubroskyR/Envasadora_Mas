@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const cors = require('cors');
+const { PERIODOS_DIAS, BIDONES_MAXIMOS, consumoValido, semanalDerivado, calcularAjuste } = require('./consumo');
 require('dotenv').config();
 
 const app = express();
@@ -85,6 +86,25 @@ const prepararBaseDeDatos = async () => {
     CREATE UNIQUE INDEX IF NOT EXISTS pagos_id_local_unico ON pagos (id_local);
     CREATE UNIQUE INDEX IF NOT EXISTS gastos_id_local_unico ON gastos (id_local);
 
+    -- Consumo con período: bidones cada 7, 14, 21 o 30 días (antes era solo bidones por semana).
+    -- consumo_desde: desde qué fecha cuentan las entregas para el ajuste automático (ver consumo.js).
+    -- consumo_ajustado_en y consumo_anterior_*: el último ajuste automático, para avisarlo y poder deshacerlo.
+    -- consumo_semanal_estimado se sigue llenando (redondeado) para la versión anterior de la app.
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_bidones INTEGER;
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_dias INTEGER;
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_desde DATE;
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_ajustado_en DATE;
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_anterior_bidones INTEGER;
+    ALTER TABLE clientes ADD COLUMN IF NOT EXISTS consumo_anterior_dias INTEGER;
+    UPDATE clientes
+       SET consumo_bidones = COALESCE(consumo_bidones, GREATEST(COALESCE(consumo_semanal_estimado, 1), 1)),
+           consumo_dias = COALESCE(consumo_dias, 7)
+     WHERE consumo_bidones IS NULL OR consumo_dias IS NULL;
+    ALTER TABLE clientes ALTER COLUMN consumo_bidones SET DEFAULT 1;
+    ALTER TABLE clientes ALTER COLUMN consumo_bidones SET NOT NULL;
+    ALTER TABLE clientes ALTER COLUMN consumo_dias SET DEFAULT 7;
+    ALTER TABLE clientes ALTER COLUMN consumo_dias SET NOT NULL;
+
     -- creado_en era "timestamp sin zona": guardaba la hora en la zona de cada conexión, así que los
     -- registros viejos (en UTC) y los nuevos (hora argentina) no se podían comparar y el historial
     -- de finanzas quedaba desordenado. Con timestamptz se guarda el instante exacto.
@@ -151,6 +171,17 @@ const fechaValida = (valor) => {
 // por si el reloj del teléfono está mal configurado.
 const sqlFechaMovimiento = (parametro) =>
   `LEAST(GREATEST(COALESCE(${parametro}::date, CURRENT_DATE), CURRENT_DATE - 90), CURRENT_DATE)`;
+
+// Consumo que manda el teléfono al crear un cliente: bidones (se redondea; vacío o 0 → 1) y días del período
+// (7 si no viene). Si solo llega consumo_semanal_estimado (versión anterior de la app), son N por semana.
+// Devuelve null si el período no es uno de los de la app (ver consumo.js).
+const consumoDelAlta = (body) => {
+  const conPeriodo = 'consumo_bidones' in body || 'consumo_dias' in body;
+  const bidones = Math.round(aNumero(conPeriodo ? body.consumo_bidones : body.consumo_semanal_estimado) ?? 0);
+  const dias = conPeriodo ? (aNumero(body.consumo_dias) ?? 7) : 7;
+  const consumo = { bidones: bidones > 0 ? bidones : 1, dias };
+  return consumoValido(consumo.bidones, consumo.dias) ? consumo : null;
+};
 
 // Hace ROLLBACK sin que un fallo del propio ROLLBACK (ej. conexión caída) tape el error original.
 const rollbackSeguro = async (client) => {
@@ -237,8 +268,9 @@ app.post('/api/login', (req, res) => {
 // Ruta GET: Comprobar que el servidor responde. La app la usa para saber cuándo volvió la conexión
 // y enviar lo que se cargó sin señal. No requiere sesión ni toca la base de datos.
 // "base" dice cómo terminó la preparación de la base al arrancar: 'preparando', 'lista' o 'error'.
+// "version" es el commit publicado (Render lo pone en RENDER_GIT_COMMIT), para confirmar cada publicación.
 app.get('/api/salud', (req, res) => {
-  res.json({ ok: true, base: estadoBase });
+  res.json({ ok: true, base: estadoBase, version: process.env.RENDER_GIT_COMMIT?.slice(0, 7) });
 });
 
 // Todas las rutas /api definidas DESPUÉS de este middleware requieren un token válido
@@ -270,11 +302,15 @@ app.get('/api/clientes', async (req, res) => {
 app.post('/api/clientes', async (req, res) => {
   try {
     // 1. Extraemos los datos que nos envía el frontend
-    const { nombre, apodo, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud } = req.body;
+    const { nombre, apodo, direccion, telefono, barrio, latitud, longitud } = req.body;
 
-    // 2. Validación básica: asegurarnos de que al menos envíen el nombre
+    // 2. Validación básica: asegurarnos de que al menos envíen el nombre y un consumo válido
     if (!nombre || !String(nombre).trim()) {
       return res.status(400).json({ error: 'El nombre del cliente es obligatorio' });
+    }
+    const consumo = consumoDelAlta(req.body);
+    if (!consumo) {
+      return res.status(400).json({ error: `El consumo no es válido (de 1 a ${BIDONES_MAXIMOS} bidones y un período de la lista)` });
     }
 
     // 3. Consulta SQL parametrizada (Los $1, $2 evitan hackeos por inyección SQL)
@@ -282,24 +318,25 @@ app.post('/api/clientes', async (req, res) => {
     // Si ya existe un cliente con el mismo id_local, es un reintento desde el teléfono: no se crea otro.
     const idLocal = idLocalValido(req.body.id_local);
     const query = `
-      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud, apodo, id_local)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO clientes (nombre, direccion, telefono, consumo_semanal_estimado, barrio, latitud, longitud, apodo, id_local,
+                            consumo_bidones, consumo_dias)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       ON CONFLICT (id_local) DO NOTHING
       RETURNING *;
     `;
 
-    // Si no envían consumo estimado, por defecto será 1 (la columna es entera)
-    const consumo = aNumero(consumo_semanal_estimado);
     const values = [
       String(nombre).trim(),
       vacioANull(direccion),
       vacioANull(telefono),
-      consumo && consumo > 0 ? Math.round(consumo) : 1,
+      semanalDerivado(consumo),
       vacioANull(barrio),
       aNumero(latitud),
       aNumero(longitud),
       vacioANull(String(apodo ?? '').trim()),
-      idLocal
+      idLocal,
+      consumo.bidones,
+      consumo.dias
     ];
 
     // 4. Ejecutamos la consulta en la base de datos
@@ -424,34 +461,91 @@ app.put('/api/clientes/:id', async (req, res) => {
     agregar(columna, numero);
   }
 
-  if ('consumo_semanal_estimado' in body) {
-    const consumo = aNumero(body.consumo_semanal_estimado);
-    if (!consumo || consumo <= 0) {
-      return res.status(400).json({ error: 'El consumo semanal debe ser mayor a 0' });
+  // Consumo con período (ver consumo.js). Si llega uno solo de los dos datos, el otro queda como está.
+  // La versión anterior de la app manda solo consumo_semanal_estimado.
+  let pedidoConsumo = null;
+  if ('consumo_bidones' in body || 'consumo_dias' in body) {
+    // Los bidones se redondean antes de validar, como en el alta
+    const bidones = 'consumo_bidones' in body ? Math.round(aNumero(body.consumo_bidones) ?? 0) : null;
+    const dias = 'consumo_dias' in body ? aNumero(body.consumo_dias) : null;
+    if (bidones !== null && !(bidones >= 1 && bidones <= BIDONES_MAXIMOS)) {
+      return res.status(400).json({ error: `El consumo tiene que ser de 1 a ${BIDONES_MAXIMOS} bidones` });
     }
-    agregar('consumo_semanal_estimado', Math.round(consumo));
+    if ('consumo_dias' in body && !PERIODOS_DIAS.includes(dias)) {
+      return res.status(400).json({ error: 'El período del consumo no es válido' });
+    }
+    pedidoConsumo = { bidones, dias };
+  } else if ('consumo_semanal_estimado' in body) {
+    const semanal = Math.round(aNumero(body.consumo_semanal_estimado) ?? 0);
+    if (!(semanal >= 1 && semanal <= BIDONES_MAXIMOS)) {
+      return res.status(400).json({ error: `El consumo tiene que ser de 1 a ${BIDONES_MAXIMOS} bidones` });
+    }
+    pedidoConsumo = { semanal };
   }
 
-  if (sets.length === 0) {
+  if (sets.length === 0 && !pedidoConsumo) {
     return res.status(400).json({ error: 'No se enviaron datos para actualizar' });
   }
 
+  // Con consumo hay que compararlo con el guardado (bloqueando la fila del cliente) para saber si cambió.
+  // Sin consumo alcanza con una sola consulta, como siempre.
+  const conexion = pedidoConsumo ? await pool.connect() : null;
+  const db = conexion ?? pool;
   try {
-    // Los nombres de columna salen de la lista fija de arriba (nunca del usuario), y los valores van parametrizados
-    values.push(id);
-    const result = await pool.query(
-      `UPDATE clientes SET ${sets.join(', ')} WHERE id = $${values.length} AND eliminado_en IS NULL RETURNING *;`,
-      values
-    );
+    if (conexion) {
+      await conexion.query('BEGIN');
+      const actual = await conexion.query(
+        'SELECT consumo_bidones, consumo_dias, consumo_semanal_estimado FROM clientes WHERE id = $1 AND eliminado_en IS NULL FOR UPDATE',
+        [id]
+      );
+      if (actual.rows.length === 0) {
+        await rollbackSeguro(conexion);
+        return res.status(404).json({ error: 'Cliente no encontrado' });
+      }
+      const a = actual.rows[0];
+      // La versión anterior de la app manda el formulario completo aunque no haya tocado el consumo:
+      // si el número semanal es el mismo que ya tenía, no se le pisa el período
+      const nuevo = 'semanal' in pedidoConsumo
+        ? (pedidoConsumo.semanal === a.consumo_semanal_estimado
+          ? { bidones: a.consumo_bidones, dias: a.consumo_dias }
+          : { bidones: pedidoConsumo.semanal, dias: 7 })
+        : { bidones: pedidoConsumo.bidones ?? a.consumo_bidones, dias: pedidoConsumo.dias ?? a.consumo_dias };
+      if (nuevo.bidones !== a.consumo_bidones || nuevo.dias !== a.consumo_dias) {
+        // Cambio a mano: la cuenta del ajuste vuelve a empezar hoy y se borra el aviso del último ajuste
+        agregar('consumo_bidones', nuevo.bidones);
+        agregar('consumo_dias', nuevo.dias);
+        agregar('consumo_semanal_estimado', semanalDerivado(nuevo));
+        sets.push('consumo_desde = CURRENT_DATE', 'consumo_ajustado_en = NULL',
+          'consumo_anterior_bidones = NULL', 'consumo_anterior_dias = NULL');
+      }
+    }
 
-    if (result.rows.length === 0) {
+    let cliente;
+    if (sets.length > 0) {
+      // Los nombres de columna salen de la lista fija de arriba (nunca del usuario), y los valores van parametrizados
+      values.push(id);
+      const result = await db.query(
+        `UPDATE clientes SET ${sets.join(', ')} WHERE id = $${values.length} AND eliminado_en IS NULL RETURNING *;`,
+        values
+      );
+      cliente = result.rows[0];
+    } else {
+      // Solo llegó el mismo consumo que ya tenía: no hay nada que cambiar
+      cliente = (await db.query('SELECT * FROM clientes WHERE id = $1', [id])).rows[0];
+    }
+    if (conexion) await conexion.query('COMMIT');
+
+    if (!cliente) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    res.json({ mensaje: 'Cliente actualizado', cliente: result.rows[0] });
+    res.json({ mensaje: 'Cliente actualizado', cliente });
   } catch (err) {
+    if (conexion) await rollbackSeguro(conexion);
     console.error(err.message);
     res.status(500).send('Error al actualizar el cliente');
+  } finally {
+    conexion?.release();
   }
 });
 
@@ -550,7 +644,39 @@ app.post('/api/entregas', async (req, res) => {
       WHERE e.id = $2 AND c.id = $3;
     `, [montoAdeudado, resultadoEntrega.rows[0].id, cliente_id]);
 
-    // 5. Confirmamos que todo salió bien y guardamos los cambios
+    // 5. Ajuste automático del consumo (ver consumo.js): si el cliente viene pidiendo con otro ritmo de forma
+    // sostenida, se le cambia el consumo y se guarda el anterior para poder deshacerlo.
+    // Va en un savepoint: si esta cuenta falla, se deshace solo el ajuste y la entrega se guarda igual
+    // (si no, la entrega quedaría trabada en la cola del teléfono, reintentando para siempre).
+    await client.query('SAVEPOINT ajuste_consumo');
+    try {
+      const datosConsumo = await client.query(
+        `SELECT consumo_bidones, consumo_dias, to_char(consumo_desde, 'YYYY-MM-DD') AS desde FROM clientes WHERE id = $1`,
+        [cliente_id]
+      );
+      const { consumo_bidones, consumo_dias, desde } = datosConsumo.rows[0];
+      const ultimasEntregas = await client.query(
+        `SELECT to_char(fecha, 'YYYY-MM-DD') AS fecha, cantidad_bidones AS bidones
+         FROM entregas WHERE cliente_id = $1 ORDER BY fecha DESC, id DESC LIMIT 60`,
+        [cliente_id]
+      );
+      const ajuste = calcularAjuste(ultimasEntregas.rows, { bidones: consumo_bidones, dias: consumo_dias }, desde);
+      if (ajuste) {
+        await client.query(`
+          UPDATE clientes
+          SET consumo_anterior_bidones = consumo_bidones, consumo_anterior_dias = consumo_dias,
+              consumo_bidones = $1, consumo_dias = $2, consumo_semanal_estimado = $3,
+              consumo_ajustado_en = $4, consumo_desde = $4
+          WHERE id = $5;
+        `, [ajuste.bidones, ajuste.dias, semanalDerivado(ajuste), ajuste.fecha, cliente_id]);
+      }
+      await client.query('RELEASE SAVEPOINT ajuste_consumo');
+    } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT ajuste_consumo');
+      console.error('No se pudo calcular el ajuste del consumo:', err.message);
+    }
+
+    // 6. Confirmamos que todo salió bien y guardamos los cambios
     await client.query('COMMIT');
 
     // Devolvemos los datos de la entrega recién creada
